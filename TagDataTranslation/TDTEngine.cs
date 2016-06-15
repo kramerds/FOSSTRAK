@@ -26,8 +26,9 @@ using System.IO;
 using System.Xml.Serialization;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
+#if !PocketPC
 using System.Threading.Tasks;
-
+#endif
 namespace FOSSTRAK.TDT
 {
     /// <summary>
@@ -108,11 +109,14 @@ namespace FOSSTRAK.TDT
             parameterList = parameterList.Trim();
             outputFormat = outputFormat ?? String.Empty;
             outputFormat = outputFormat.Trim();
-            LevelTypeList type;
+            LevelTypeList type = LevelTypeList.BINARY;
             if (String.IsNullOrEmpty(epcIdentifier)) throw new ArgumentNullException("epcIdentifier");
             if (String.IsNullOrEmpty(outputFormat)) throw new ArgumentNullException("outputFormat");
+#if PocketPC
+            if (!EnumHelper.TryParse<LevelTypeList>(outputFormat, ref type)) throw new ArgumentException("Invalid outputFormat", "outputFormat");
+#else 
             if (!Enum.TryParse<LevelTypeList>(outputFormat, out type)) throw new ArgumentException("Invalid outputFormat", "outputFormat");
-
+#endif
             // convert the paramterList string to IEnumerable<Kvp<String, String>>
             List<KeyValuePair<String, String>> parameters = new List<KeyValuePair<string, string>>();
             String[] split = parameterList.Split(';');
@@ -172,7 +176,7 @@ namespace FOSSTRAK.TDT
             ProcessRules(outputOption, ModeList.FORMAT, tokens);
 
             // Convert the tokens to binary if we have to
-            ConvertTokensToBinary(outputOption, tokens);
+            ConvertTokensToBinary(inputOption, outputOption, tokens);
 
             // use ABNF grammer to build the output string
             return BuildGrammer(outputOption, tokens);
@@ -206,8 +210,14 @@ namespace FOSSTRAK.TDT
         private void LoadGEPC64Table()
         {
             _gs1cpi = new Dictionary<string, string>();
+#if PocketPC
+            FileInfo fi = new FileInfo(System.Reflection.Assembly.GetExecutingAssembly().GetName().CodeBase);
+            string schemePath = fi.Directory + @"\Resources\Auxiliary\ManagerTranslation.xml";
+            XmlReader reader = XmlReader.Create(schemePath);
+#else
             XmlReader reader = XmlReader.Create(Environment.CurrentDirectory +
                 @"\Resources\Auxiliary\ManagerTranslation.xml");
+#endif
             while (reader.Read())
             {
                 if (reader.Name == "entry")
@@ -218,12 +228,49 @@ namespace FOSSTRAK.TDT
             }
         }
 
+#if PocketPC
         /// <summary>
         /// Method for loading all of the *.xml schemes files from disk to main memory data structures
         /// </summary>
         private void LoadEpcTagDataTranslations()
         {
             // reinit _options and read the file system for the scheme files
+            this._options = new List<Tuple<Scheme, Level, Option>>();
+            FileInfo fi = new FileInfo(System.Reflection.Assembly.GetExecutingAssembly().GetName().CodeBase);
+            string schemePath = fi.Directory + @"\Resources\Schemes";
+            String[] fileNames = Directory.GetFiles(schemePath);
+
+            // thread out the reading/deserialization
+            for (int i = 0; i < fileNames.Length; i++)
+            {
+                var fileName = fileNames[i];
+                // deserialize the file into the xsd.exe classes
+                XmlSerializer serializer = new XmlSerializer(typeof(EpcTagDataTranslation));
+                EpcTagDataTranslation tdt = (EpcTagDataTranslation)serializer.Deserialize(new FileStream(((String)fileName), FileMode.Open));
+
+                // do a breadth first traversal to flatten out and add to the list
+                foreach (Scheme s in tdt.scheme)
+                {
+                    foreach (Level l in s.level)
+                    {
+                        foreach (Option o in l.option)
+                        {
+                            lock (_options)
+                            {
+                                _options.Add(new Tuple<Scheme, Level, Option>(s, l, o));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#else
+        /// <summary>
+        /// Method for loading all of the *.xml schemes files from disk to main memory data structures
+        /// </summary>
+        private void LoadEpcTagDataTranslations()
+        {
+             // reinit _options and read the file system for the scheme files
             this._options = new List<Tuple<Scheme, Level, Option>>();
             String[] fileNames = Directory.GetFiles(Environment.CurrentDirectory + @"\Resources\Schemes");
 
@@ -256,6 +303,7 @@ namespace FOSSTRAK.TDT
             }
             Task.WaitAll(tasks);
         }
+#endif
 
         /// <summary>
         /// Gets the Option for the input and the inputParameters
@@ -271,10 +319,10 @@ namespace FOSSTRAK.TDT
             // build an über query for finding the correct option
             var query = from option in _options
                         where ((!String.IsNullOrEmpty(option.Item2.prefixMatch)) && (epcIdentifier.StartsWith(option.Item2.prefixMatch))) &&
-                              ((!tagLength.HasValue) || (int.Parse(option.Item1.tagLength) == tagLength.Value)) &
-                              (new Regex(String.Format(c_REGEXLINEFORMATTER, option.Item3.pattern)).Match(epcIdentifier).Success) &
-                              (((option.Item2.type != LevelTypeList.BINARY) & (option.Item2.type != LevelTypeList.PURE_IDENTITY) & (option.Item2.type != LevelTypeList.TAG_ENCODING)) &
-                                (option.Item3.optionKey == GetInputParameterValue(option.Item1.optionKey, paramterList)))
+                              (((!tagLength.HasValue) || (String.IsNullOrEmpty(option.Item1.tagLength))) || (int.Parse(option.Item1.tagLength) == tagLength.Value)) &&
+                              (new Regex(String.Format(c_REGEXLINEFORMATTER, option.Item3.pattern)).Match(epcIdentifier).Success) &&
+                              (((option.Item2.type == LevelTypeList.BINARY) || (option.Item2.type == LevelTypeList.PURE_IDENTITY) || (option.Item2.type == LevelTypeList.TAG_ENCODING)) ||
+                              (String.IsNullOrEmpty(option.Item1.optionKey) || (option.Item3.optionKey == GetInputParameterValue(option.Item1.optionKey, paramterList))))
                         select option;
 
             // process the results
@@ -311,7 +359,17 @@ namespace FOSSTRAK.TDT
                             String functionName = m.Groups[1].Value.ToLower().Trim();
                             String[] functionParameters = m.Groups[2].Value.Split(',');
                             //String field1Name = option.Item3.field.Single(f => f.name == functionParameters[0]).name;
-                            String field1Value = tokens[functionParameters[0]];
+                            Match mx = new Regex(("^[0-9]*$")).Match(functionParameters[0]);
+
+                            String field1Value;
+                            if (mx.Success)
+                            {
+                                field1Value = functionParameters[0];
+                            }
+                            else
+                            {
+                                field1Value = tokens[functionParameters[0]];
+                            }
                             switch (functionName)
                             {
                                 case "tablelookup":
@@ -349,7 +407,7 @@ namespace FOSSTRAK.TDT
                                             {
                                                 weight = -1;
                                             }
-                                            d = int.Parse(field1Value.Substring(len - 1 - i, len - i));
+                                            d = int.Parse(field1Value.Substring(len - 1 - i, 1)); // kasuga fixed
                                             total += weight * d;
                                         }
                                         checksum = (10 + total % 10) % 10;
@@ -359,7 +417,11 @@ namespace FOSSTRAK.TDT
                                 case "substr":
                                     {
                                         int offset;
+#if PocketPC
+                                        if (!ParseAssistant.TryParse(functionParameters[1], out offset))
+#else
                                         if (!int.TryParse(functionParameters[1], out offset))
+#endif
                                         {
                                             offset = int.Parse(tokens[functionParameters[1]]);
                                         }
@@ -370,7 +432,11 @@ namespace FOSSTRAK.TDT
                                         else if (functionParameters.Length == 3)
                                         {
                                             int length;
+#if PocketPC
+                                            if (!ParseAssistant.TryParse(functionParameters[2], out length))
+#else
                                             if (!int.TryParse(functionParameters[2], out length))
+#endif
                                             {
                                                 length = int.Parse(tokens[functionParameters[2]]);
                                             }
@@ -383,7 +449,7 @@ namespace FOSSTRAK.TDT
                                         StringBuilder buffer = new StringBuilder();
                                         for (int p1 = 0; p1 < functionParameters.Length; p1++)
                                         {
-                                            Match m2 = new Regex(("\"(.*?)\"|'(.*?)'|[0-9]")).Match(functionParameters[p1]);
+                                            Match m2 = new Regex(("^\"(.*?)\"$|^'(.*?)'$|^[0-9]*$")).Match(functionParameters[p1]);
                                             if (m2.Success)
                                             {
                                                 buffer.Append(functionParameters[p1]);
@@ -466,6 +532,7 @@ namespace FOSSTRAK.TDT
                     // check if it is compacted
                     if (f.compactionSpecified)
                     {
+                        Field f_output = outputOption.Item3.field.Single((f2) => f2.name == f.name);
                         int? compactNumber = null;
                         switch (f.compaction)
                         {
@@ -493,7 +560,7 @@ namespace FOSSTRAK.TDT
                         token = BinaryToString(token, compactNumber.Value);
 
                         // check the character set
-                        CheckTokenCharacterSet(f, token);
+                        CheckTokenCharacterSet(f_output, token); // kasuga fix
                     }
                     else
                     {
@@ -510,25 +577,31 @@ namespace FOSSTRAK.TDT
                             CheckTokenMinMax(f, token);
                         }
                     }
-
-                    Field outputField = outputOption.Item3.field.Single((f2) => f2.name == f.name);
-                    if (f.padDirSpecified)
+                    try
                     {
-                        if (outputField.padDirSpecified)
+                        Field outputField = outputOption.Item3.field.Single((f2) => f2.name == f.name);
+                        if (f.padDirSpecified)
                         {
-                            throw new TDTTranslationException("Invalid TDT definition file");
+                            if (outputField.padDirSpecified)
+                            {
+                                throw new TDTTranslationException("Invalid TDT definition file");
+                            }
+                            else
+                            {
+                                token = StripPadChar(token, f.padDir, f.padChar);
+                            }
                         }
                         else
                         {
-                            token = StripPadChar(token, f.padDir, f.padChar);
+                            if (outputField.padDirSpecified)
+                            {
+                                token = ApplyPadChar(token, outputField.padDir, outputField.padChar, int.Parse(outputField.length));
+                            }
                         }
                     }
-                    else
+                    catch (System.InvalidOperationException)
                     {
-                        if (outputField.padDirSpecified)
-                        {
-                            token = ApplyPadChar(token, outputField.padDir, outputField.padChar, int.Parse(outputField.length));
-                        }
+                        // kasuga just ignore.
                     }
                 }
                 else
@@ -556,7 +629,10 @@ namespace FOSSTRAK.TDT
         private String BuildGrammer(Tuple<Scheme, Level, Option> outputOption, Dictionary<String, String> tokens)
         {
             StringBuilder outboundstring = new StringBuilder();
-            String[] fields = new Regex("\\s+").Split(outputOption.Item3.grammar);
+            String[] fields = new Regex("'.*?'|\\S+").Matches(outputOption.Item3.grammar) // kasuga modify to match grammar="'ADI DAC ' dodaac '/serial=' serial" pattern
+                .Cast<Match>()
+                .Select(m => m.Groups[0].Value)
+                .ToArray();
             for (int i = 0; i < fields.Length; i++)
             {
                 String formattedparam;
@@ -569,7 +645,7 @@ namespace FOSSTRAK.TDT
                     if ((outputOption.Item2.type == LevelTypeList.TAG_ENCODING) || (outputOption.Item2.type == LevelTypeList.PURE_IDENTITY))
                     {
 
-                        formattedparam = Uri.UnescapeDataString(tokens[fields[i]]);
+                        formattedparam = Uri.EscapeDataString(tokens[fields[i]]); // kasuga unescape -> escape
                     }
                     else
                     {
@@ -590,7 +666,7 @@ namespace FOSSTRAK.TDT
         {
             if (!String.IsNullOrEmpty(f.characterSet))
             {
-                String pattern = (f.characterSet.EndsWith("*")) ? f.characterSet : f.characterSet += "*";
+                String pattern = (f.characterSet.EndsWith("*") || f.characterSet.EndsWith("+")) ? f.characterSet : f.characterSet += "*"; // kasuga fix for "[...]+"regex pattern
                 if (!new Regex(String.Format(c_REGEXLINEFORMATTER, pattern)).IsMatch(token))
                 {
                     throw new TDTTranslationException("Invalid " + f.name + " field value " + token + " according to its character set " + f.characterSet);
@@ -633,9 +709,15 @@ namespace FOSSTRAK.TDT
             if ((!String.IsNullOrEmpty(f.decimalMinimum)) &&
                 (!String.IsNullOrEmpty(f.decimalMaximum)) &&
                 (!String.IsNullOrEmpty(token)) &&
+#if PocketPC
+                (ParseAssistant.TryParse(token, out result)) &
+                (ParseAssistant.TryParse(f.decimalMinimum, out min)) &
+                (ParseAssistant.TryParse(f.decimalMaximum, out max)))
+#else
                 (Decimal.TryParse(token, out result)) &
                 (Decimal.TryParse(f.decimalMinimum, out min)) &
                 (Decimal.TryParse(f.decimalMaximum, out max)))
+#endif
             {
                 if (result < min)
                 {
@@ -698,7 +780,7 @@ namespace FOSSTRAK.TDT
         /// <param name="value"></param>
         /// <param name="compaction"></param>
         /// <returns></returns>
-        private String BinaryToString(String value, int compaction)
+        public String BinaryToString(String value, int compaction)
         {
             // TODO Buy ISO 15962 and figure out how single char compaction works 
             // with RFID this is just a logical port of the java 1.4 FOSSTRAK implementation
@@ -712,10 +794,46 @@ namespace FOSSTRAK.TDT
                     return bin2asciiseven(value);
                 case 8:
                     return bin2bytestring(value);
+                case 9:
+                    return bin2hexstring(value);
                 // future unicode support goes here
+                   
                 default:
                     throw new TDTTranslationException("unsupported compaction method " + compaction.ToString());
             }
+        }
+
+        private string bin2hexstring(string binary)
+        {
+            // TODO Buy ISO 15962 and figure out how single char compaction works 
+            // with RFID this is just a logical port of the java 1.4 FOSSTRAK implementation
+            String bytestring;
+            StringBuilder buffer = new StringBuilder();
+            if (binary.Length % 8 != 0)
+            {
+                //pad the string until it is a multiple of 8.
+                binary = binary.PadRight(binary.Length + (8 - (binary.Length % 8)), '0');
+            }
+
+            int len = binary.Length;
+            
+            byte j = 0;
+            for (int i = 0; i < len; i += 8)
+            {
+                try
+                {
+                    j = byte.Parse(Bin2Dec(padBinary(binary.Substring(i, 8), 8))); // kasuga fix
+                    buffer.Append(j.ToString("X2"));
+                }
+                catch (Exception e)
+                {
+                    
+                    throw;
+                }
+               
+            }
+            bytestring = buffer.ToString();
+            return bytestring;
         }
 
         private String bin2bytestring(String binary)
@@ -727,7 +845,7 @@ namespace FOSSTRAK.TDT
             int len = binary.Length;
             for (int i = 0; i < len; i += 8)
             {
-                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, i + 8), 8)));
+                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, 8), 8))); // kasuga fix
                 buffer.Append((char)j);
             }
             bytestring = buffer.ToString();
@@ -743,7 +861,7 @@ namespace FOSSTRAK.TDT
             int len = binary.Length;
             for (int i = 0; i < len; i += 7)
             {
-                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, i + 7), 8)));
+                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, 7), 8))); // kasuga fix
                 buffer.Append((char)j);
             }
             asciiseven = buffer.ToString();
@@ -759,7 +877,7 @@ namespace FOSSTRAK.TDT
             int len = binary.Length;
             for (int i = 0; i < len; i += 6)
             {
-                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, i + 6), 8)));
+                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, 6), 8))); // kasuga fix
                 if (j < 32)
                 {
                     j += 64;
@@ -779,7 +897,7 @@ namespace FOSSTRAK.TDT
             int len = binary.Length;
             for (int i = 0; i < len; i += 5)
             {
-                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, i + 5), 8)));
+                int j = int.Parse(Bin2Dec(padBinary(binary.Substring(i, 5), 8))); // kasuga fix
                 buffer.Append((char)(j + 64));
             }
             uppercasefive = buffer.ToString();
@@ -797,7 +915,7 @@ namespace FOSSTRAK.TDT
             }
             else
             {
-                long dec = long.Parse(binary);
+                Int64 dec = Convert.ToInt64(binary, 2); // kasuga fix restrictions that can convert bin2hex up to 64bit binary
                 return dec.ToString();
             }
         }
@@ -843,7 +961,7 @@ namespace FOSSTRAK.TDT
             byte[] bytes = Encoding.ASCII.GetBytes(uppercasefive);
             for (int i = 0; i < len; i++)
             {
-                buffer.Append(padBinary(dec2bin((bytes[i] % 32).ToString()), 8).Substring(3, 8));
+                buffer.Append(padBinary(dec2bin((bytes[i] % 32).ToString()), 8).Substring(3, 5)); // kasuga fix
             }
             return buffer.ToString();
         }
@@ -857,7 +975,7 @@ namespace FOSSTRAK.TDT
             byte[] bytes = Encoding.ASCII.GetBytes(alphanumsix);
             for (int i = 0; i < len; i++)
             {
-                buffer.Append(padBinary(dec2bin((bytes[i] % 64).ToString()),8).Substring(2, 8));
+                buffer.Append(padBinary(dec2bin((bytes[i] % 64).ToString()), 8).Substring(2, 6)); // kasuga fix
             }
             return buffer.ToString();
         }
@@ -872,7 +990,7 @@ namespace FOSSTRAK.TDT
             for (int i = 0; i < len; i++)
             {
                 buffer.Append(padBinary(dec2bin((bytes[i] % 128).ToString()),
-                        8).Substring(1, 8));
+                        8).Substring(1, 7)); // kasuga fixed 
             }
             return buffer.ToString();
         }
@@ -918,7 +1036,7 @@ namespace FOSSTRAK.TDT
             }
         }
 
-        private void ConvertTokensToBinary(Tuple<Scheme, Level, Option> outputOption, Dictionary<String, String> tokens)
+        private void ConvertTokensToBinary(Tuple<Scheme, Level, Option> inputOption, Tuple<Scheme, Level, Option> outputOption, Dictionary<String, String> tokens)
         {
             if (outputOption.Item2.type == LevelTypeList.BINARY)
             {
@@ -935,7 +1053,8 @@ namespace FOSSTRAK.TDT
                     // now convert to binary
                     if (f.compactionSpecified)
                     {
-                        CheckTokenCharacterSet(f, tokens[f.name]);
+                        Field f_input = inputOption.Item3.field.Single((n) => n.name == f.name);
+                        CheckTokenCharacterSet(f_input, tokens[f.name]);
 
                         tokens[f.name] = StringToBinary(tokens[f.name], f.compaction);
                     }
